@@ -37,60 +37,57 @@ def extrair_dados_e_metadados(pdf_bytes):
         if match_periodo:
             meta["periodo"] = f"A partir de {match_periodo.group(1).strip()}"
 
-    # Divide o texto do PDF usando como separador o padrão 'Nossa No' (15 a 17 dígitos numéricos)
-    blocos = re.split(r'(?=\b\d{15,17}\b)', texto_completo)
+    # Quebra o texto por linhas
+    linhas = [l.strip() for l in texto_completo.split('\n') if l.strip()]
 
-    for bloco in blocos:
-        # Verifica se o bloco contém uma liquidação de crédito (ex: LIQUIDACAO ... C)
-        if 'LIQUIDACAO' in bloco.upper() and re.search(r'[\d\.]+\,\d{2}\s*C', bloco):
-            linhas = [l.strip() for l in bloco.split('\n') if l.strip()]
+    # Identifica as posições onde ocorre LIQUIDACAO com entrada de Crédito
+    for idx, linha in enumerate(linhas):
+        if 'LIQUIDACAO' in linha.upper() and ('COMPENSACAO' in linha.upper() or 'BLOQUETO' in linha.upper() or re.search(r'[\d\.]+\,\d{2}C', linha)):
             
-            # Captura de datas no bloco (dd/mm/aaaa)
+            # Bloco de linhas ao redor da liquidação
+            bloco = " ".join(linhas[max(0, idx-8):min(len(linhas), idx+3)])
+            
+            # Captura de datas
             datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', bloco)
             vencto = datas[0] if len(datas) >= 1 else "-"
             data_pgto = datas[1] if len(datas) >= 2 else (datas[0] if len(datas) == 1 else "-")
             
-            # Captura os valores monetários com indicação de Crédito (C)
-            match_valor_credito = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C', bloco)
-            match_todos_valores = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', bloco)
+            # Captura de valores (com "C" para crédito)
+            val_credito = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C', bloco)
+            todos_valores = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', bloco)
             
-            if match_valor_credito:
-                val_pago_str = match_valor_credito[0]
-            elif len(match_todos_valores) >= 2:
-                val_pago_str = match_todos_valores[1]
-            elif len(match_todos_valores) == 1:
-                val_pago_str = match_todos_valores[0]
+            if val_credito:
+                v_pago_str = val_credito[0]
+            elif todos_valores:
+                v_pago_str = todos_valores[0]
             else:
-                val_pago_str = "0,00"
-
-            val_orig_str = match_todos_valores[0] if match_todos_valores else val_pago_str
-
-            v_orig = float(val_orig_str.replace('.', '').replace(',', '.'))
-            v_pago = float(val_pago_str.replace('.', '').replace(',', '.'))
+                v_pago_str = "0,00"
+                
+            v_orig_str = todos_valores[0] if todos_valores else v_pago_str
             
-            # Extração e tratamento do Nome Sacado e Nome do Imóvel
-            # Filtra palavras do bloco ignorando datas, valores e termos técnicos do extrato
-            palavras_ignoradas = {'LIQUIDACAO', 'BLOQUETO', 'COMPENSACAO', 'SIM', 'NAO', 'CIP', 'TARIFA', 'DEB/CRED'}
-            linhas_texto = []
-            for l in linhas:
-                if not re.search(r'\d{2}/\d{2}/\d{4}', l) and not re.search(r'[\d\.]+\,\d{2}', l) and not l.isdigit():
-                    partes = [p for p in l.split() if p.upper() not in palavras_ignoradas]
-                    if partes:
-                        linhas_texto.append(" ".join(partes))
+            v_orig = float(v_orig_str.replace('.', '').replace(',', '.'))
+            v_pago = float(v_pago_str.replace('.', '').replace(',', '.'))
             
-            texto_nomes = " ".join(linhas_texto)
-            partes_nome = texto_nomes.split()
+            # Pega o histórico das linhas acima para isolar Nome e Imóvel
+            nomes_bloco = []
+            for i in range(max(0, idx-6), idx):
+                txt = linhas[i]
+                if not re.search(r'\d{2}/\d{2}/\d{4}', txt) and not re.search(r'[\d\.]+\,\d{2}', txt) and not re.match(r'^\d+$', txt):
+                    if not any(k in txt.upper() for k in ['CAIXA', 'CEDENTE', 'EXTRATO', 'NOSSA NO', 'SEU NO', 'VENCTO', 'LIQUIDACAO', 'SIM', 'CIP']):
+                        nomes_bloco.append(txt)
             
-            if len(partes_nome) >= 4:
-                meio = len(partes_nome) // 2
-                nome_pagador = " ".join(partes_nome[:meio])
-                nome_imovel = " ".join(partes_nome[meio:])
-            elif partes_nome:
-                nome_pagador = " ".join(partes_nome)
-                nome_imovel = "-"
+            texto_nomes = " ".join(nomes_bloco).strip()
+            
+            # Separação simples de Pagador x Imóvel
+            if 'SALA' in texto_nomes.upper() or 'MOD' in texto_nomes.upper():
+                partes = re.split(r'(SALA[^\n]*|MOD[^\n]*)', texto_nomes, flags=re.IGNORECASE)
+                nome_pagador = partes[0].strip() if partes[0].strip() else "Não identificado"
+                nome_imovel = "".join(partes[1:]).strip() if len(partes) > 1 else "-"
             else:
-                nome_pagador = "Não identificado"
-                nome_imovel = "-"
+                palavras = texto_nomes.split()
+                meio = len(palavras) // 2
+                nome_pagador = " ".join(palavras[:meio]) if palavras else "Não identificado"
+                nome_imovel = " ".join(palavras[meio:]) if len(palavras) > 1 else "-"
 
             boletos_liquidados.append({
                 "Nome do Pagador": nome_pagador,
@@ -98,9 +95,9 @@ def extrair_dados_e_metadados(pdf_bytes):
                 "Data de Vencimento": vencto,
                 "Data de Pagamento": data_pgto,
                 "Valor Original": v_orig,
-                "Valor Original Formatado": f"R$ {val_orig_str}",
+                "Valor Original Formatado": f"R$ {v_orig_str}",
                 "Valor Pago": v_pago,
-                "Valor Pago Formatado": f"R$ {val_pago_str}",
+                "Valor Pago Formatado": f"R$ {v_pago_str}",
                 "Status": "Liquidado"
             })
 
