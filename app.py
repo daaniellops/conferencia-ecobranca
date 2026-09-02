@@ -37,13 +37,11 @@ def extrair_dados_e_metadados(pdf_bytes):
         if match_periodo:
             meta["periodo"] = f"A partir de {match_periodo.group(1).strip()}"
 
-        # Varredura das páginas para extrair tabelas/textos
         texto_completo = ""
         for page in pdf.pages:
             texto_completo += (page.extract_text() or "") + "\n"
 
-    # Expressão regular para identificar os blocos de liquidação de bloquetos
-    # Procura a estrutura típica de linhas contendo "LIQUIDACAO BLOQUETO"
+    # Regex para capturar os blocos de liquidação
     padrao_liquidacao = re.compile(
         r'(\d{10,18})\s*\|\s*([^\|]+)\s*\|\s*([^\|]*)\s*\|\s*(\d{2}/\d{2}/\d{4})\s*\|\s*(\d{2}/\d{2}/\d{4})\s*\|\s*([\d\.\,]+)\s*\|\s*([\d\.\,]+)\s*\|\s*[^\|]*\|\s*([^\|]*LIQUIDACAO[^\|]*)',
         re.MULTILINE | re.DOTALL
@@ -54,7 +52,6 @@ def extrair_dados_e_metadados(pdf_bytes):
     for m in matches:
         nossa_no, nome_sacado, seu_no, vencto, data_pgto, valor_titulo, liq_recebido, historico = m
         
-        # Filtra estritamente liquidações do tipo BLOQUETO - COMPENSACAO
         if "LIQUIDACAO" in historico.upper() and "BLOQUETO" in historico.upper():
             v_orig = float(valor_titulo.replace('.', '').replace(',', '.'))
             v_pago = float(liq_recebido.replace('.', '').replace(',', '.'))
@@ -85,57 +82,60 @@ def gerar_pdf_relatorio(meta, df_boletos):
     for idx, row in df_boletos.iterrows():
         linhas_tabela += f"""
         <tr>
-            <td style="text-align: center;">{idx+1:02d}</td>
+            <td align="center">{idx+1:02d}</td>
             <td>{row['Nome do Pagador']}</td>
             <td>{row['Nome do Imóvel']}</td>
-            <td style="text-align: center;">{row['Data de Vencimento']}</td>
-            <td style="text-align: center;">{row['Data de Pagamento']}</td>
-            <td style="text-align: right;">{row['Valor Original Formatado']}</td>
-            <td style="text-align: right; font-weight: bold; color: #166534;">{row['Valor Pago Formatado']}</td>
-            <td style="text-align: center; color: #166534; font-size: 7.5pt; font-weight: bold;">{row['Status']}</td>
+            <td align="center">{row['Data de Vencimento']}</td>
+            <td align="center">{row['Data de Pagamento']}</td>
+            <td align="right">{row['Valor Original Formatado']}</td>
+            <td align="right"><b>{row['Valor Pago Formatado']}</b></td>
+            <td align="center">Liquidado</td>
         </tr>
         """
 
+    # HTML com formatação compatível com xhtml2pdf
     html_full = f"""
-    <!DOCTYPE html>
     <html>
     <head>
-        <meta charset="UTF-8">
         <style>
             @page {{ size: a4 landscape; margin: 1cm; }}
-            body {{ font-family: Helvetica, Arial, sans-serif; color: #1e293b; font-size: 8pt; }}
-            .header {{ background-color: #1e3a8a; color: white; padding: 10px; margin-bottom: 10px; border-radius: 4px; }}
-            .info-table {{ width: 100%; margin-bottom: 10px; background-color: #f8fafc; padding: 6px; border: 1px solid #e2e8f0; }}
-            table.data-table {{ width: 100%; border-collapse: collapse; margin-top: 5px; }}
-            table.data-table th {{ background-color: #f1f5f9; padding: 6px; text-align: left; font-size: 7.5pt; border-bottom: 2px solid #cbd5e1; }}
+            body {{ font-family: Helvetica, Arial, sans-serif; font-size: 8pt; color: #111111; }}
+            .header-table {{ width: 100%; background-color: #1e3a8a; color: #ffffff; padding: 8px; margin-bottom: 10px; }}
+            .info-table {{ width: 100%; background-color: #f1f5f9; padding: 6px; margin-bottom: 10px; border: 1px solid #cbd5e1; }}
+            table.data-table {{ width: 100%; border-collapse: collapse; }}
+            table.data-table th {{ background-color: #e2e8f0; padding: 5px; font-size: 7.5pt; border-bottom: 1px solid #94a3b8; }}
             table.data-table td {{ padding: 5px; border-bottom: 1px solid #e2e8f0; font-size: 7.5pt; }}
-            .total-card {{ background-color: #f0fdf4; border: 1px solid #bbf7d0; padding: 8px; font-size: 10pt; font-weight: bold; color: #166534; margin-top: 10px; text-align: right; }}
+            .total-box {{ background-color: #dcfce7; border: 1px solid #86efac; padding: 8px; font-size: 9.5pt; font-weight: bold; color: #166534; text-align: right; margin-top: 10px; }}
         </style>
     </head>
     <body>
-        <div class="header">
-            <h2 style="margin:0; font-size: 11pt;">CONSULTA EXTRATO E-COBRANÇA</h2>
-            <p style="margin:2px 0 0 0; font-size: 9pt;"><b>CEDENTE:</b> {meta['cedente']}</p>
-        </div>
+        <table class="header-table">
+            <tr>
+                <td>
+                    <font size="3"><b>CONSULTA EXTRATO E-COBRANÇA</b></font><br/>
+                    <b>CEDENTE:</b> {meta['cedente']}
+                </td>
+            </tr>
+        </table>
         
         <table class="info-table">
             <tr>
                 <td><b>Período:</b> {meta['periodo']}</td>
-                <td style="text-align: right;"><b>Data de Emissão:</b> {data_emissao}</td>
+                <td align="right"><b>Data de Emissão:</b> {data_emissao}</td>
             </tr>
         </table>
 
         <table class="data-table">
             <thead>
                 <tr>
-                    <th width="4%" style="text-align: center;">Item</th>
-                    <th width="24%">Nome do Pagador</th>
+                    <th width="4%">Item</th>
+                    <th width="26%">Nome do Pagador</th>
                     <th width="20%">Nome do Imóvel (Seu N°)</th>
-                    <th width="11%" style="text-align: center;">Data Venc.</th>
-                    <th width="11%" style="text-align: center;">Data Pagto</th>
-                    <th width="11%" style="text-align: right;">Valor Original</th>
-                    <th width="11%" style="text-align: right;">Valor Pago</th>
-                    <th width="8%" style="text-align: center;">Situação</th>
+                    <th width="10%">Data Venc.</th>
+                    <th width="10%">Data Pagto</th>
+                    <th width="11%">Valor Original</th>
+                    <th width="11%">Valor Pago</th>
+                    <th width="8%">Situação</th>
                 </tr>
             </thead>
             <tbody>
@@ -143,7 +143,7 @@ def gerar_pdf_relatorio(meta, df_boletos):
             </tbody>
         </table>
 
-        <div class="total-card">
+        <div class="total-box">
             VALOR TOTAL DE CRÉDITOS: {fmt_brl(total_creditos)}
         </div>
     </body>
@@ -151,7 +151,11 @@ def gerar_pdf_relatorio(meta, df_boletos):
     """
     
     pdf_buffer = io.BytesIO()
-    pisa.CreatePDF(io.StringIO(html_full), dest=pdf_buffer)
+    pisa_status = pisa.CreatePDF(src=io.StringIO(html_full), dest=pdf_buffer)
+    
+    if pisa_status.err:
+        return None
+        
     return pdf_buffer.getvalue()
 
 if arquivo_pdf is not None:
@@ -185,11 +189,14 @@ if arquivo_pdf is not None:
         
         pdf_out = gerar_pdf_relatorio(meta, df_boletos)
         
-        st.download_button(
-            label="📄 Baixar Relatório Ajustado em PDF",
-            data=pdf_out,
-            file_name=f"Extrato_E_Cobranca_{meta['cedente'].replace(' ', '_')}.pdf",
-            mime="application/pdf"
-        )
+        if pdf_out:
+            st.download_button(
+                label="📄 Baixar Relatório Ajustado em PDF",
+                data=pdf_out,
+                file_name=f"Extrato_E_Cobranca_{meta['cedente'].replace(' ', '_')}.pdf",
+                mime="application/pdf"
+            )
+        else:
+            st.error("Erro ao gerar o PDF. Verifique a estrutura HTML.")
     else:
         st.warning("Nenhum boleto liquidado foi encontrado no extrato enviado.")
