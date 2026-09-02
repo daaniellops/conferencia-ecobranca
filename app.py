@@ -37,69 +37,98 @@ def extrair_dados_e_metadados(pdf_bytes):
         if match_periodo:
             meta["periodo"] = f"A partir de {match_periodo.group(1).strip()}"
 
-    # Quebra o texto por linhas
+    # Limpeza básica e separação por linhas
     linhas = [l.strip() for l in texto_completo.split('\n') if l.strip()]
 
-    # Identifica as posições onde ocorre LIQUIDACAO com entrada de Crédito
+    # Procura linhas que representem o encerramento de um lançamento de liquidação (Valor seguido de 'C')
     for idx, linha in enumerate(linhas):
-        if 'LIQUIDACAO' in linha.upper() and ('COMPENSACAO' in linha.upper() or 'BLOQUETO' in linha.upper() or re.search(r'[\d\.]+\,\d{2}C', linha)):
+        # Verifica se na linha atual ou na próxima há a indicação de Crédito e LIQUIDACAO
+        if re.search(r'[\d\.]+\,\d{2}\s*C', linha) or ('LIQUIDACAO' in linha.upper() and any('C' in x for x in linha.split())):
             
-            # Bloco de linhas ao redor da liquidação
-            bloco = " ".join(linhas[max(0, idx-8):min(len(linhas), idx+3)])
+            # Reúne o bloco de texto referente a este lançamento (linhas anteriores e atuais)
+            inicio_bloco = max(0, idx - 10)
+            fim_bloco = min(len(linhas), idx + 3)
+            trecho_bloco = linhas[inicio_bloco:fim_bloco]
+            texto_bloco = " ".join(trecho_bloco)
             
-            # Captura de datas
-            datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', bloco)
-            vencto = datas[0] if len(datas) >= 1 else "-"
-            data_pgto = datas[1] if len(datas) >= 2 else (datas[0] if len(datas) == 1 else "-")
-            
-            # Captura de valores (com "C" para crédito)
-            val_credito = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C', bloco)
-            todos_valores = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', bloco)
-            
-            if val_credito:
-                v_pago_str = val_credito[0]
-            elif todos_valores:
-                v_pago_str = todos_valores[0]
-            else:
-                v_pago_str = "0,00"
+            # Filtro rigoroso: Apenas lançamentos que possuem a palavra LIQUIDACAO
+            if 'LIQUIDACAO' in texto_bloco.upper():
                 
-            v_orig_str = todos_valores[0] if todos_valores else v_pago_str
-            
-            v_orig = float(v_orig_str.replace('.', '').replace(',', '.'))
-            v_pago = float(v_pago_str.replace('.', '').replace(',', '.'))
-            
-            # Pega o histórico das linhas acima para isolar Nome e Imóvel
-            nomes_bloco = []
-            for i in range(max(0, idx-6), idx):
-                txt = linhas[i]
-                if not re.search(r'\d{2}/\d{2}/\d{4}', txt) and not re.search(r'[\d\.]+\,\d{2}', txt) and not re.match(r'^\d+$', txt):
-                    if not any(k in txt.upper() for k in ['CAIXA', 'CEDENTE', 'EXTRATO', 'NOSSA NO', 'SEU NO', 'VENCTO', 'LIQUIDACAO', 'SIM', 'CIP']):
-                        nomes_bloco.append(txt)
-            
-            texto_nomes = " ".join(nomes_bloco).strip()
-            
-            # Separação simples de Pagador x Imóvel
-            if 'SALA' in texto_nomes.upper() or 'MOD' in texto_nomes.upper():
-                partes = re.split(r'(SALA[^\n]*|MOD[^\n]*)', texto_nomes, flags=re.IGNORECASE)
-                nome_pagador = partes[0].strip() if partes[0].strip() else "Não identificado"
-                nome_imovel = "".join(partes[1:]).strip() if len(partes) > 1 else "-"
-            else:
-                palavras = texto_nomes.split()
-                meio = len(palavras) // 2
-                nome_pagador = " ".join(palavras[:meio]) if palavras else "Não identificado"
-                nome_imovel = " ".join(palavras[meio:]) if len(palavras) > 1 else "-"
+                # Extrai datas (dd/mm/aaaa) presentes no bloco
+                datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', texto_bloco)
+                vencto = datas[0] if len(datas) >= 1 else "-"
+                data_pgto = datas[1] if len(datas) >= 2 else (datas[0] if len(datas) == 1 else "-")
+                
+                # Extrai os valores numéricos do bloco
+                valores_com_c = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C', texto_bloco)
+                todos_valores = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', texto_bloco)
+                
+                if valores_com_c:
+                    v_pago_str = valores_com_c[0]
+                elif len(todos_valores) >= 2:
+                    v_pago_str = todos_valores[1]
+                elif len(todos_valores) == 1:
+                    v_pago_str = todos_valores[0]
+                else:
+                    v_pago_str = "0,00"
+                    
+                v_orig_str = todos_valores[0] if todos_valores else v_pago_str
+                
+                v_orig = float(v_orig_str.replace('.', '').replace(',', '.'))
+                v_pago = float(v_pago_str.replace('.', '').replace(',', '.'))
+                
+                # Ignora estritamente tarifas (valores com 'D' de débito no final)
+                if re.search(r'TARIFA', texto_bloco.upper()) and not valores_com_c:
+                    continue
+                
+                # Coleta os elementos de texto das linhas do bloco ignorando comandos/valores do sistema
+                palavras_descartar = {'CAIXA', 'CEDENTE', 'NOSSA', 'SACADO', 'SEU', 'VENCTO', 'DATA', 'PAGTO', 
+                                      'VALOR', 'TITULO', 'LIQ.', 'RECEBIDO', 'DESC/ABAT', 'ENC/DESP', 'DÉB/CRÉD', 
+                                      'HISTÓRICO', 'CIP', 'LIQUIDACAO', 'BLOQUETO', 'COMPENSACAO', 'SIM', 'NO'}
+                
+                nomes_brutos = []
+                for l in trecho_bloco:
+                    # Remove datas, valores e números de documento
+                    l_limpa = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', l)
+                    l_limpa = re.sub(r'\b\d{1,3}(?:\.\d{3})*,\d{2}[CD]?\b', '', l_limpa)
+                    l_limpa = re.sub(r'\b\d{10,18}\b', '', l_limpa)
+                    
+                    tokens = [t for t in l_limpa.split() if t.upper() not in palavras_descartar and len(t) > 1]
+                    if tokens:
+                        nomes_brutos.append(" ".join(tokens))
+                
+                string_nomes = " ".join(nomes_brutos)
+                
+                # Separação dinâmica de Nome do Pagador e Nome do Imóvel (Seu N°)
+                if re.search(r'\b(SALA|MOD|APTO|LOJA|CASA|BLK|BLOCO)\b', string_nomes, re.IGNORECASE):
+                    partes = re.split(r'(\b(?:SALA|MOD|APTO|LOJA|CASA|BLK|BLOCO)\b.*)', string_nomes, flags=re.IGNORECASE)
+                    nome_pagador = partes[0].strip() if partes[0].strip() else "Não identificado"
+                    nome_imovel = partes[1].strip() if len(partes) > 1 else "-"
+                else:
+                    palavras_nome = string_nomes.split()
+                    if len(palavras_nome) >= 3:
+                        corte = len(palavras_nome) // 2
+                        nome_pagador = " ".join(palavras_nome[:corte])
+                        nome_imovel = " ".join(palavras_nome[corte:])
+                    else:
+                        nome_pagador = string_nomes if string_nomes else "Não identificado"
+                        nome_imovel = "-"
 
-            boletos_liquidados.append({
-                "Nome do Pagador": nome_pagador,
-                "Nome do Imóvel": nome_imovel,
-                "Data de Vencimento": vencto,
-                "Data de Pagamento": data_pgto,
-                "Valor Original": v_orig,
-                "Valor Original Formatado": f"R$ {v_orig_str}",
-                "Valor Pago": v_pago,
-                "Valor Pago Formatado": f"R$ {v_pago_str}",
-                "Status": "Liquidado"
-            })
+                # Evita duplicidades na lista
+                registro = {
+                    "Nome do Pagador": nome_pagador,
+                    "Nome do Imóvel": nome_imovel,
+                    "Data de Vencimento": vencto,
+                    "Data de Pagamento": data_pgto,
+                    "Valor Original": v_orig,
+                    "Valor Original Formatado": f"R$ {v_orig_str}",
+                    "Valor Pago": v_pago,
+                    "Valor Pago Formatado": f"R$ {v_pago_str}",
+                    "Status": "Liquidado"
+                }
+                
+                if registro not in boletos_liquidados:
+                    boletos_liquidados.append(registro)
 
     return meta, pd.DataFrame(boletos_liquidados)
 
