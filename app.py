@@ -37,37 +37,55 @@ def extrair_dados_e_metadados(pdf_bytes):
         if match_periodo:
             meta["periodo"] = f"A partir de {match_periodo.group(1).strip()}"
 
-        texto_completo = ""
         for page in pdf.pages:
-            texto_completo += (page.extract_text() or "") + "\n"
-
-    # Regex para capturar os blocos de liquidação
-    padrao_liquidacao = re.compile(
-        r'(\d{10,18})\s*\|\s*([^\|]+)\s*\|\s*([^\|]*)\s*\|\s*(\d{2}/\d{2}/\d{4})\s*\|\s*(\d{2}/\d{2}/\d{4})\s*\|\s*([\d\.\,]+)\s*\|\s*([\d\.\,]+)\s*\|\s*[^\|]*\|\s*([^\|]*LIQUIDACAO[^\|]*)',
-        re.MULTILINE | re.DOTALL
-    )
-
-    matches = padrao_liquidacao.findall(texto_completo)
-
-    for m in matches:
-        nossa_no, nome_sacado, seu_no, vencto, data_pgto, valor_titulo, liq_recebido, historico = m
-        
-        if "LIQUIDACAO" in historico.upper() and "BLOQUETO" in historico.upper():
-            v_orig = float(valor_titulo.replace('.', '').replace(',', '.'))
-            v_pago = float(liq_recebido.replace('.', '').replace(',', '.'))
+            texto = page.extract_text() or ""
+            linhas = [l.strip() for l in texto.split('\n') if l.strip()]
             
-            boletos_liquidados.append({
-                "Nossa No": nossa_no.strip(),
-                "Nome do Pagador": " ".join(nome_sacado.split()),
-                "Nome do Imóvel": " ".join(seu_no.split()) if seu_no.strip() else "-",
-                "Data de Vencimento": vencto.strip(),
-                "Data de Pagamento": data_pgto.strip(),
-                "Valor Original": v_orig,
-                "Valor Original Formatado": f"R$ {valor_titulo.strip()}",
-                "Valor Pago": v_pago,
-                "Valor Pago Formatado": f"R$ {liq_recebido.strip()}",
-                "Status": "Liquidado (Bloqueto - Compensação)"
-            })
+            # Processa as linhas do PDF buscando por eventos de LIQUIDAÇÃO
+            for i, linha in enumerate(linhas):
+                if 'LIQUIDACAO' in linha.upper() and ('BLOQUETO' in linha.upper() or 'COMPENSACAO' in linha.upper()):
+                    
+                    # Procura os valores na linha atual ou na linha imediatamente anterior
+                    match_valores = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', linha)
+                    
+                    # Captura a data de vencimento e pagamento
+                    datas = re.findall(r'(\d{2}/\d{2}/\d{4})', linha)
+                    if not datas and i > 0:
+                        datas = re.findall(r'(\d{2}/\d{2}/\d{4})', linhas[i-1])
+                    
+                    vencto = datas[0] if len(datas) >= 1 else "-"
+                    data_pgto = datas[1] if len(datas) >= 2 else (datas[0] if len(datas) == 1 else "-")
+                    
+                    # Captura de valores (Valor Título e Liq. Recebido)
+                    if len(match_valores) >= 2:
+                        val_orig_str, val_pago_str = match_valores[0], match_valores[1]
+                    elif len(match_valores) == 1:
+                        val_orig_str = val_pago_str = match_valores[0]
+                    else:
+                        val_orig_str = val_pago_str = "0,00"
+                        
+                    v_orig = float(val_orig_str.replace('.', '').replace(',', '.'))
+                    v_pago = float(val_pago_str.replace('.', '').replace(',', '.'))
+                    
+                    # Coleta o nome/imóvel analisando as linhas anteriores do mesmo bloco
+                    bloco_anterior = " ".join(linhas[max(0, i-4):i])
+                    
+                    # Filtra possíveis nomes limpos do pagador
+                    nomes_encontrados = re.findall(r'[A-Z\s]{5,}', bloco_anterior)
+                    nome_pagador = " ".join(nomes_encontrados[0].split()) if nomes_encontrados else "Não identificado"
+                    nome_imovel = " ".join(nomes_encontrados[1].split()) if len(nomes_encontrados) > 1 else "-"
+                    
+                    boletos_liquidados.append({
+                        "Nome do Pagador": nome_pagador,
+                        "Nome do Imóvel": nome_imovel,
+                        "Data de Vencimento": vencto,
+                        "Data de Pagamento": data_pgto,
+                        "Valor Original": v_orig,
+                        "Valor Original Formatado": f"R$ {val_orig_str}",
+                        "Valor Pago": v_pago,
+                        "Valor Pago Formatado": f"R$ {val_pago_str}",
+                        "Status": "Liquidado (Bloqueto - Compensação)"
+                    })
 
     return meta, pd.DataFrame(boletos_liquidados)
 
@@ -93,7 +111,6 @@ def gerar_pdf_relatorio(meta, df_boletos):
         </tr>
         """
 
-    # HTML com formatação compatível com xhtml2pdf
     html_full = f"""
     <html>
     <head>
@@ -197,6 +214,6 @@ if arquivo_pdf is not None:
                 mime="application/pdf"
             )
         else:
-            st.error("Erro ao gerar o PDF. Verifique a estrutura HTML.")
+            st.error("Erro ao gerar o PDF.")
     else:
         st.warning("Nenhum boleto liquidado foi encontrado no extrato enviado.")
