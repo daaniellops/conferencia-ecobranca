@@ -19,7 +19,7 @@ def normalizar(texto):
     if not texto:
         return ""
     nfkd = unicodedata.normalize('NFKD', texto)
-    return u"".join([c for c in nfkd if not unicodedata.combining(c)]).upper()
+    return "".join([c for c in nfkd if not unicodedata.combining(c)]).upper()
 
 def extrair_dados_e_metadados(pdf_bytes):
     meta = {
@@ -38,33 +38,50 @@ def extrair_dados_e_metadados(pdf_bytes):
 
     linhas_puras = [l.strip() for l in texto_completo.split('\n') if l.strip()]
 
-    # 1. Extração do Responsável pela Conta
-    for l in linhas_puras[:8]:
+    # 1. Responsável pela Conta (Nome + CPF)
+    for l in linhas_puras[:10]:
         if re.search(r'\d{3}\.\d{3}\.\d{3}\-\d{2}', l) and 'CEDENTE' not in l.upper():
             meta["responsavel"] = l.strip()
             break
 
-    # 2. Extração do Cedente
+    # 2. Cedente
     match_cedente = re.search(r'Cedente\s*:\s*([^\n\:]+)', texto_completo, re.IGNORECASE)
     if match_cedente:
         c_nome = match_cedente.group(1).strip()
         c_nome = re.sub(r'::.*$', '', c_nome).strip()
         meta["cedente"] = f"Cedente: {c_nome}"
 
-    # 3. Extração do Período
+    # 3. Período
     match_periodo = re.search(r'a partir de\s*([\d\/]+)', texto_completo, re.IGNORECASE)
     if match_periodo:
         meta["periodo"] = f"A partir de {match_periodo.group(1).strip()}"
 
-    # 4. Extração dos Boletos Liquidados
+    # 4. Boletos Liquidados
     documentos_processados = set()
     linhas_norm = [normalizar(l) for l in linhas_puras]
 
+    # Termos e cabeçalhos do relatório da Caixa a serem eliminados
+    cabecalhos_descarte = {
+        'DE MOVIMENTACAO DE TITULOS A PARTIR DE', 'EXTRATO DE MOVIMENTACAO',
+        'NOSSO NO', 'SEU NO', 'NOME SACADO', 'VENCTO', 'DATA PAGTO',
+        'VALOR TITULO', 'LIQ. RECEBIDO', 'DESC/ABAT', 'ENC/DESP', 'DEB/CRED',
+        'HISTORICO', 'CIP', 'QUANTIDADE DE TITULOS', 'VALOR TOTAL', 'IMPRIMIR FECHAR'
+    }
+
+    termos_isolados_ignorar = {
+        'CAIXA', 'CEDENTE', 'NOSSO', 'NOSSA', 'SACADO', 'SEU', 'VENCTO', 'DATA', 
+        'PAGTO', 'VALOR', 'TITULO', 'LIQ', 'RECEBIDO', 'DESC/ABAT', 'DESC', 'ABAT',
+        'ENC/DESP', 'ENC', 'DESP', 'DEB/CRED', 'DEB', 'CRED', 'HISTORICO', 'CIP', 
+        'LIQUIDACAO', 'BLOQUETO', 'COMPENSACAO', 'SIM', 'NAO', 'NO', 'EXTRATO', 
+        'CONSULTA', 'COBRANCA', 'MOVIMENTACAO', 'TITULOS', 'PARTIR'
+    }
+
     for idx, l_norm in enumerate(linhas_norm):
+        # Localiza a linha com valor de crédito final (ex: 5.608,72C ou 282,19C)
         match_cred = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C\b', l_norm)
         
         if match_cred:
-            inicio = max(0, idx - 6)
+            inicio = max(0, idx - 8)
             fim = min(len(linhas_norm), idx + 3)
             bloco_norm = " ".join(linhas_norm[inicio:fim])
             
@@ -89,25 +106,33 @@ def extrair_dados_e_metadados(pdf_bytes):
                 v_orig = float(val_orig_str.replace('.', '').replace(',', '.'))
                 v_pago = float(val_pago_str.replace('.', '').replace(',', '.'))
 
-                termos_ignorar = {
-                    'CAIXA', 'CEDENTE', 'NOSSA', 'SACADO', 'SEU', 'VENCTO', 'DATA', 
-                    'PAGTO', 'VALOR', 'TITULO', 'LIQ', 'RECEBIDO', 'DESC/ABAT', 
-                    'ENC/DESP', 'DEB/CRED', 'HISTORICO', 'CIP', 'LIQUIDACAO', 
-                    'BLOQUETO', 'COMPENSACAO', 'SIM', 'NAO', 'NO', 'EXTRATO', 'CONSULTA'
-                }
-
+                # Extração limpa do Nome do Pagador
                 palavras_sacado = []
-                for lin in linhas_puras[inicio:idx+1]:
+                for lin in linhas_puras[inicio:idx+2]:
+                    lin_upper = normalizar(lin)
+                    
+                    # Descarta linhas inteiras que sejam cabeçalho do extrato
+                    if any(cab in lin_upper for cab in cabecalhos_descarte):
+                        continue
+                    if 'CEDENTE:' in lin_upper or 'CONSULTA EXTRATO' in lin_upper:
+                        continue
+
+                    # Remove datas, valores e identificadores numéricos
                     l_limpa = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', lin)
                     l_limpa = re.sub(r'\b\d{1,3}(?:\.\d{3})*,\d{2}[CD]?\b', '', l_limpa)
                     l_limpa = re.sub(r'\b\d{10,18}\b', '', l_limpa)
                     
                     for token in l_limpa.split():
-                        tok_sem_pont = re.sub(r'[^\w]', '', token)
-                        if tok_sem_pont.isdigit() and len(tok_sem_pont) <= 5:
+                        tok_clean = re.sub(r'[^\w]', '', token)
+                        tok_norm = normalizar(tok_clean)
+                        
+                        # Remove números do Seu Nº (ex: 412, 565)
+                        if tok_clean.isdigit() and len(tok_clean) <= 6:
                             continue
-                        if normalizar(tok_sem_pont) not in termos_ignorar and len(tok_sem_pont) > 0:
-                            palavras_sacado.append(token)
+                        if tok_norm in termos_isolados_ignorar or len(tok_clean) == 0:
+                            continue
+                        
+                        palavras_sacado.append(token)
 
                 nome_pagador = " ".join(palavras_sacado).strip()
                 if not nome_pagador:
@@ -146,7 +171,6 @@ def gerar_pdf_relatorio(meta, df_boletos):
         </tr>
         """
 
-    # Estrutura com medidas absolutas e sem conflito de padding para evitar a quebra do ReportLab
     html_full = f"""
     <html>
     <head>
