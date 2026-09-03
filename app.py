@@ -39,7 +39,7 @@ def extrair_dados_e_metadados(pdf_bytes):
     linhas_puras = [l.strip() for l in texto_completo.split('\n') if l.strip()]
 
     # 1. Responsável pela Conta (Nome + CPF)
-    for l in linhas_puras[:10]:
+    for l in linhas_puras[:12]:
         if re.search(r'\d{3}\.\d{3}\.\d{3}\-\d{2}', l) and 'CEDENTE' not in l.upper():
             meta["responsavel"] = l.strip()
             break
@@ -53,101 +53,97 @@ def extrair_dados_e_metadados(pdf_bytes):
 
     # 3. Período
     match_periodo = re.search(r'a partir de\s*([\d\/]+)', texto_completo, re.IGNORECASE)
+    data_filtro_periodo = ""
     if match_periodo:
-        meta["periodo"] = f"A partir de {match_periodo.group(1).strip()}"
+        data_filtro_periodo = match_periodo.group(1).strip()
+        meta["periodo"] = f"A partir de {data_filtro_periodo}"
 
-    # 4. Boletos Liquidados
-    documentos_processados = set()
-    linhas_norm = [normalizar(l) for l in linhas_puras]
+    # 4. Captura Universal de Liquidações com Base na Âncora de Crédito (C)
+    # Procura todo padrão monetário com indicação de crédito final (ex: 4.821,17C)
+    ocorrencias_credito = [
+        m for m in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C\b', texto_completo)
+    ]
 
-    # Termos e cabeçalhos do relatório da Caixa a serem eliminados
-    cabecalhos_descarte = {
-        'DE MOVIMENTACAO DE TITULOS A PARTIR DE', 'EXTRATO DE MOVIMENTACAO',
-        'NOSSO NO', 'SEU NO', 'NOME SACADO', 'VENCTO', 'DATA PAGTO',
-        'VALOR TITULO', 'LIQ. RECEBIDO', 'DESC/ABAT', 'ENC/DESP', 'DEB/CRED',
-        'HISTORICO', 'CIP', 'QUANTIDADE DE TITULOS', 'VALOR TOTAL', 'IMPRIMIR FECHAR'
-    }
-
-    termos_isolados_ignorar = {
-        'CAIXA', 'CEDENTE', 'NOSSO', 'NOSSA', 'SACADO', 'SEU', 'VENCTO', 'DATA', 
+    termos_ignorar = {
+        'CAIXA', 'CEDENTE', 'NOSSA', 'NOSSO', 'SACADO', 'SEU', 'VENCTO', 'DATA', 
         'PAGTO', 'VALOR', 'TITULO', 'LIQ', 'RECEBIDO', 'DESC/ABAT', 'DESC', 'ABAT',
         'ENC/DESP', 'ENC', 'DESP', 'DEB/CRED', 'DEB', 'CRED', 'HISTORICO', 'CIP', 
         'LIQUIDACAO', 'BLOQUETO', 'COMPENSACAO', 'SIM', 'NAO', 'NO', 'EXTRATO', 
         'CONSULTA', 'COBRANCA', 'MOVIMENTACAO', 'TITULOS', 'PARTIR'
     }
 
-    for idx, l_norm in enumerate(linhas_norm):
-        # Localiza a linha com valor de crédito final (ex: 5.608,72C ou 282,19C)
-        match_cred = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C\b', l_norm)
-        
-        if match_cred:
-            inicio = max(0, idx - 8)
-            fim = min(len(linhas_norm), idx + 3)
-            bloco_norm = " ".join(linhas_norm[inicio:fim])
+    docs_processados = set()
+
+    for m in ocorrencias_credito:
+        pos_fim = m.end()
+        # Analisa uma janela de texto de 450 caracteres antes e 150 após o valor com 'C'
+        janela = texto_completo[max(0, m.start() - 450):min(len(texto_completo), pos_fim + 150)]
+        janela_norm = normalizar(janela)
+
+        # Confirma que é uma liquidação de título
+        if 'LIQUIDAC' in janela_norm and 'BLOQUETO' in janela_norm:
+            val_pago_str = m.group(1)
+            v_pago = float(val_pago_str.replace('.', '').replace(',', '.'))
+
+            # Identifica Nosso Nº para controle de unicidade
+            match_doc = re.search(r'\b(14\d{13,15})\b', janela)
+            doc_id = match_doc.group(1) if match_doc else f"VAL_{val_pago_str}_{m.start()}"
+            if doc_id in docs_processados:
+                continue
+            docs_processados.add(doc_id)
+
+            # Extrai datas válidas na vizinhança imediata
+            datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', janela)
+            datas_filtradas = [d for d in datas if d != data_filtro_periodo]
+
+            if len(datas_filtradas) >= 2:
+                data_vencimento = datas_filtradas[0]
+                data_pagamento = datas_filtradas[1]
+            elif len(datas_filtradas) == 1:
+                data_vencimento = data_pagamento = datas_filtradas[0]
+            else:
+                data_vencimento = data_pagamento = "-"
+
+            # Valor original
+            todos_valores = re.findall(r'\b(\d{1,3}(?:\.\d{3})*,\d{2})\b', janela)
+            valores_sem_tarifa = [v for v in todos_valores if float(v.replace('.', '').replace(',', '.')) >= 50.0]
+            val_orig_str = valores_sem_tarifa[0] if valores_sem_tarifa else val_pago_str
+            v_orig = float(val_orig_str.replace('.', '').replace(',', '.'))
+
+            # Extração limpa do Sacado
+            linhas_janela = [l.strip() for l in janela.split('\n') if l.strip()]
+            palavras_sacado = []
             
-            if 'LIQUIDAC' in bloco_norm or 'BLOQUETO' in bloco_norm:
-                match_doc = re.search(r'\b(\d{14,17})\b', bloco_norm)
-                doc_id = match_doc.group(1) if match_doc else f"DOC_{idx}"
-                
-                if doc_id in documentos_processados:
+            for l in linhas_janela:
+                l_norm = normalizar(l)
+                if any(x in l_norm for x in ['CONSULTA', 'CEDENTE', 'NOSSO NO', 'HISTORICO', 'VALOR TITULO', 'A PARTIR DE']):
                     continue
-                documentos_processados.add(doc_id)
-
-                bloco_orig = " ".join(linhas_puras[inicio:fim])
-                datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', bloco_orig)
                 
-                data_vencimento = datas[0] if len(datas) >= 1 else "-"
-                data_pagamento = datas[1] if len(datas) >= 2 else data_vencimento
+                l_limpa = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', l)
+                l_limpa = re.sub(r'\b\d{1,3}(?:\.\d{3})*,\d{2}[CD]?\b', '', l_limpa)
+                l_limpa = re.sub(r'\b\d{10,18}\b', '', l_limpa)
 
-                val_pago_str = match_cred.group(1)
-                todos_valores = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', bloco_orig)
-                val_orig_str = todos_valores[0] if todos_valores else val_pago_str
-
-                v_orig = float(val_orig_str.replace('.', '').replace(',', '.'))
-                v_pago = float(val_pago_str.replace('.', '').replace(',', '.'))
-
-                # Extração limpa do Nome do Pagador
-                palavras_sacado = []
-                for lin in linhas_puras[inicio:idx+2]:
-                    lin_upper = normalizar(lin)
-                    
-                    # Descarta linhas inteiras que sejam cabeçalho do extrato
-                    if any(cab in lin_upper for cab in cabecalhos_descarte):
+                for tok in l_limpa.split():
+                    tok_clean = re.sub(r'[^\w\-\.]', '', tok)
+                    tok_norm = normalizar(tok_clean)
+                    if tok_clean.isdigit() and len(tok_clean) <= 5:
                         continue
-                    if 'CEDENTE:' in lin_upper or 'CONSULTA EXTRATO' in lin_upper:
-                        continue
+                    if tok_norm not in termos_ignorar and len(tok_clean) > 0:
+                        palavras_sacado.append(tok_clean)
 
-                    # Remove datas, valores e identificadores numéricos
-                    l_limpa = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', lin)
-                    l_limpa = re.sub(r'\b\d{1,3}(?:\.\d{3})*,\d{2}[CD]?\b', '', l_limpa)
-                    l_limpa = re.sub(r'\b\d{10,18}\b', '', l_limpa)
-                    
-                    for token in l_limpa.split():
-                        tok_clean = re.sub(r'[^\w]', '', token)
-                        tok_norm = normalizar(tok_clean)
-                        
-                        # Remove números do Seu Nº (ex: 412, 565)
-                        if tok_clean.isdigit() and len(tok_clean) <= 6:
-                            continue
-                        if tok_norm in termos_isolados_ignorar or len(tok_clean) == 0:
-                            continue
-                        
-                        palavras_sacado.append(token)
+            # Seleciona as palavras mais próximas da ocorrência do título
+            nome_pagador = " ".join(palavras_sacado[-8:]).strip() if palavras_sacado else "Não identificado"
 
-                nome_pagador = " ".join(palavras_sacado).strip()
-                if not nome_pagador:
-                    nome_pagador = "Não identificado"
-
-                boletos_liquidados.append({
-                    "Nome do Pagador": nome_pagador,
-                    "Data de Vencimento": data_vencimento,
-                    "Data de Pagamento": data_pagamento,
-                    "Valor Original": v_orig,
-                    "Valor Original Formatado": f"R$ {val_orig_str}",
-                    "Valor Pago": v_pago,
-                    "Valor Pago Formatado": f"R$ {val_pago_str}",
-                    "Status": "Liquidado"
-                })
+            boletos_liquidados.append({
+                "Nome do Pagador": nome_pagador,
+                "Data de Vencimento": data_vencimento,
+                "Data de Pagamento": data_pagamento,
+                "Valor Original": v_orig,
+                "Valor Original Formatado": f"R$ {val_orig_str}",
+                "Valor Pago": v_pago,
+                "Valor Pago Formatado": f"R$ {val_pago_str}",
+                "Status": "Liquidado"
+            })
 
     return meta, pd.DataFrame(boletos_liquidados)
 
@@ -167,7 +163,7 @@ def gerar_pdf_relatorio(meta, df_boletos):
             <td align="center">{row['Data de Vencimento']}</td>
             <td align="center">{row['Data de Pagamento']}</td>
             <td align="right">{row['Valor Original Formatado']}</td>
-            <td align="right">{row['Valor Pago Formatado']}</td>
+            <td align="right"><b>{row['Valor Pago Formatado']}</b></td>
         </tr>
         """
 
@@ -215,7 +211,7 @@ def gerar_pdf_relatorio(meta, df_boletos):
                 background-color: #dcfce7;
                 border: 0.5pt solid #86efac;
                 padding: 6pt;
-                font-size: 9pt;
+                font-size: 9.5pt;
                 font-weight: bold;
                 color: #166534;
                 text-align: right;
