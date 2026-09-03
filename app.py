@@ -1,5 +1,6 @@
 import io
 import re
+import unicodedata
 from datetime import datetime
 import pandas as pd
 import pdfplumber
@@ -12,7 +13,16 @@ st.set_page_config(
     layout="wide"
 )
 
+st.title("📊 Consulta Extrato e-Cobrança")
+
 arquivo_pdf = st.file_uploader("Arraste e solte o PDF do extrato de cobrança aqui", type=["pdf"])
+
+def normalizar(texto):
+    if not texto:
+        return ""
+    # Remove acentos (ex: LIQUIDAÇÃO -> LIQUIDACAO)
+    nfkd = unicodedata.normalize('NFKD', texto)
+    return u"".join([c for c in nfkd if not unicodedata.combining(c)]).upper()
 
 def extrair_dados_e_metadados(pdf_bytes):
     meta = {
@@ -21,130 +31,114 @@ def extrair_dados_e_metadados(pdf_bytes):
     }
     
     boletos_liquidados = []
+    texto_bruto_acumulado = ""
     
     with pdfplumber.open(pdf_bytes) as pdf:
-        texto_bruto_paginas = []
-        todas_linhas_agrupadas = []
-        
         for page in pdf.pages:
             t = page.extract_text() or ""
-            texto_bruto_paginas.append(t)
-            
-            # Agrupa palavras pela coordenada vertical (top) com margem de tolerância de 3px
-            words = page.extract_words()
-            linhas_dict = {}
-            for w in words:
-                y = round(w['top'] / 3.5) * 3.5
-                if y not in linhas_dict:
-                    linhas_dict[y] = []
-                linhas_dict[y].append(w)
-            
-            for y in sorted(linhas_dict.keys()):
-                # Ordena as palavras da esquerda para a direita (x0)
-                palavras_linha = sorted(linhas_dict[y], key=lambda x: x['x0'])
-                texto_linha = " ".join([p['text'] for p in palavras_linha])
-                todas_linhas_agrupadas.append(texto_linha)
+            texto_bruto_acumulado += t + "\n"
 
-        texto_completo = "\n".join(texto_bruto_paginas)
+    # Identificação do Cedente
+    match_cedente = re.search(r'Cedente\s*:\s*(?:[\d\.\-\/]*\s*-\s*)?([^\n\:]+)', texto_bruto_acumulado, re.IGNORECASE)
+    if match_cedente:
+        c_nome = match_cedente.group(1).strip()
+        c_nome = re.sub(r'::.*$', '', c_nome).strip()
+        meta["cedente"] = c_nome
         
-        # Extração do Cedente
-        match_cedente = re.search(r'Cedente\s*:\s*(?:[\d\.\-\/]*\s*-\s*)?([^\n\:]+)', texto_completo, re.IGNORECASE)
-        if match_cedente:
-            nome_cedente = match_cedente.group(1).strip()
-            nome_cedente = re.sub(r'::.*$', '', nome_cedente).strip()
-            meta["cedente"] = nome_cedente
-            
-        # Extração do Período
-        match_periodo = re.search(r'a partir de\s*([\d\/]+)', texto_completo, re.IGNORECASE)
-        if match_periodo:
-            meta["periodo"] = f"A partir de {match_periodo.group(1).strip()}"
+    # Identificação do Período
+    match_periodo = re.search(r'a partir de\s*([\d\/]+)', texto_bruto_acumulado, re.IGNORECASE)
+    if match_periodo:
+        meta["periodo"] = f"A partir de {match_periodo.group(1).strip()}"
+
+    # Limpeza e separação de linhas
+    linhas_originais = [l.strip() for l in texto_bruto_acumulado.split('\n') if l.strip()]
+    linhas_norm = [normalizar(l) for l in linhas_originais]
 
     documentos_processados = set()
 
-    for i, linha in enumerate(todas_linhas_agrupadas):
-        linha_upper = linha.upper()
+    for idx, l_norm in enumerate(linhas_norm):
+        # Condição 1: A linha possui um valor de crédito final (ex: 282,19C ou 5.608,72 C)
+        # Condição 2: Está associada a LIQUIDACAO (na mesma linha ou no bloco vizinho)
+        match_cred = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C\b', l_norm)
         
-        # Identifica a linha de liquidação com indicação de crédito (C)
-        if 'LIQUIDACAO' in linha_upper and ('BLOQUETO' in linha_upper or 'COMPENSACAO' in linha_upper or re.search(r'[\d\.]+\,\d{2}\s*C', linha)):
-            
-            # Janela de contexto com a linha atual e as anteriores imediatas
-            janela = todas_linhas_agrupadas[max(0, i-4):i+1]
-            bloco_str = " ".join(janela)
-            
-            # Captura Nosso Número (14 a 17 dígitos)
-            match_doc = re.search(r'\b(\d{14,17})\b', bloco_str)
-            nosso_no = match_doc.group(1) if match_doc else f"DOC_{i}"
-            
-            # Evita duplicidades (como a linha adicional da tarifa de débito)
-            if nosso_no in documentos_processados:
-                continue
-            documentos_processados.add(nosso_no)
+        if match_cred:
+            # Pega janela de contexto ao redor da ocorrência
+            inicio = max(0, idx - 6)
+            fim = min(len(linhas_norm), idx + 4)
+            bloco_norm = " ".join(linhas_norm[inicio:fim])
+            bloco_orig = " ".join(linhas_originais[inicio:fim])
 
-            # Captura datas (dd/mm/aaaa)
-            datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', bloco_str)
-            vencto = datas[0] if len(datas) >= 1 else "-"
-            data_pgto = datas[1] if len(datas) >= 2 else (datas[0] if len(datas) == 1 else "-")
+            # Confirma que se trata de uma liquidação (ignora registros sem liquidação)
+            if 'LIQUIDAC' in bloco_norm or 'BLOQUETO' in bloco_norm:
+                
+                # Identifica o Nosso Número para evitar duplicidades
+                match_doc = re.search(r'\b(\d{14,17})\b', bloco_norm)
+                doc_id = match_doc.group(1) if match_doc else f"ID_{idx}"
+                
+                if doc_id in documentos_processados:
+                    continue
+                documentos_processados.add(doc_id)
 
-            # Captura o valor de liquidação (crédito final terminado em C)
-            val_credito = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C', bloco_str)
-            valores_gerais = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', bloco_str)
-            
-            if val_credito:
-                v_pago_str = val_credito[0]
-            elif len(valores_gerais) >= 2:
-                v_pago_str = valores_gerais[1]
-            elif len(valores_gerais) == 1:
-                v_pago_str = valores_gerais[0]
-            else:
-                v_pago_str = "0,00"
+                # Captura datas (dd/mm/aaaa)
+                datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', bloco_orig)
+                vencto = datas[0] if len(datas) >= 1 else "-"
+                data_pgto = datas[1] if len(datas) >= 2 else vencto
 
-            v_orig_str = valores_gerais[0] if valores_gerais else v_pago_str
-            
-            v_orig = float(v_orig_str.replace('.', '').replace(',', '.'))
-            v_pago = float(v_pago_str.replace('.', '').replace(',', '.'))
+                # Valores
+                val_pago_str = match_cred.group(1)
+                todos_valores = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', bloco_orig)
+                val_orig_str = todos_valores[0] if todos_valores else val_pago_str
 
-            # Extração de Nome do Pagador e Seu Nº (Imóvel)
-            termos_bloqueio = {'LIQUIDACAO', 'BLOQUETO', 'COMPENSACAO', 'SIM', 'NAO', 'CIP', 'TARIFA', 'DEB/CRED'}
-            palavras_identificadas = []
-            
-            for l_j in janela:
-                # Remove datas, valores e números de controle
-                limpo = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', l_j)
-                limpo = re.sub(r'\b\d{1,3}(?:\.\d{3})*,\d{2}[CD]?\b', '', limpo)
-                limpo = re.sub(r'\b\d{10,18}\b', '', limpo)
-                tokens = [t for t in limpo.split() if t.upper() not in termos_bloqueio and len(t) > 0]
-                if tokens:
-                    palavras_identificadas.extend(tokens)
-            
-            # O primeiro número ou código curto costuma ser o 'Seu N°' (Imóvel)
-            seu_no = "-"
-            nome_pagador_tokens = []
-            
-            for token in palavras_identificadas:
-                if seu_no == "-" and (token.isalnum() and len(token) <= 6 and not token.isalpha()):
-                    seu_no = token
-                elif seu_no == "-" and any(kw in token.upper() for kw in ['SALA', 'MOD', 'APTO', 'LOJA', 'SL']):
-                    seu_no = token
-                else:
-                    nome_pagador_tokens.append(token)
-                    
-            nome_pagador = " ".join(nome_pagador_tokens).strip()
-            if not nome_pagador:
-                nome_pagador = "Não identificado"
+                v_orig = float(val_orig_str.replace('.', '').replace(',', '.'))
+                v_pago = float(val_pago_str.replace('.', '').replace(',', '.'))
 
-            boletos_liquidados.append({
-                "Nome do Pagador": nome_pagador,
-                "Nome do Imóvel": seu_no,
-                "Data de Vencimento": vencto,
-                "Data de Pagamento": data_pgto,
-                "Valor Original": v_orig,
-                "Valor Original Formatado": f"R$ {v_orig_str}",
-                "Valor Pago": v_pago,
-                "Valor Pago Formatado": f"R$ {v_pago_str}",
-                "Status": "Liquidado"
-            })
+                # Extração de texto para Pagador e Imóvel
+                termos_ignorar = {
+                    'CAIXA', 'CEDENTE', 'NOSSA', 'SACADO', 'SEU', 'VENCTO', 'DATA', 
+                    'PAGTO', 'VALOR', 'TITULO', 'LIQ', 'RECEBIDO', 'DESC/ABAT', 
+                    'ENC/DESP', 'DEB/CRED', 'HISTORICO', 'CIP', 'LIQUIDACAO', 
+                    'BLOQUETO', 'COMPENSACAO', 'SIM', 'NAO', 'NO', 'EXTRATO', 'CONSULTA'
+                }
 
-    return meta, pd.DataFrame(boletos_liquidados)
+                palavras_validas = []
+                for lin in linhas_originais[inicio:idx+1]:
+                    limpa = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', lin)
+                    limpa = re.sub(r'\b\d{1,3}(?:\.\d{3})*,\d{2}[CD]?\b', '', limpa)
+                    limpa = re.sub(r'\b\d{10,18}\b', '', limpa)
+                    for tok in limpa.split():
+                        tok_clean = re.sub(r'[^\w]', '', tok)
+                        if normalizar(tok_clean) not in termos_ignorar and len(tok_clean) > 0:
+                            palavras_validas.append(tok)
+
+                # Seu N° costuma ser a primeira palavra alfanumérica curta ou indicativo de sala/imóvel
+                seu_no = "-"
+                pagador_toks = []
+                for p in palavras_validas:
+                    p_norm = normalizar(p)
+                    if seu_no == "-" and (p.isalnum() and len(p) <= 6 and not p.isalpha()):
+                        seu_no = p
+                    elif seu_no == "-" and any(k in p_norm for k in ['SALA', 'MOD', 'APTO', 'LOJA', 'SL']):
+                        seu_no = p
+                    else:
+                        pagador_toks.append(p)
+
+                nome_pagador = " ".join(pagador_toks).strip()
+                if not nome_pagador:
+                    nome_pagador = "Não identificado"
+
+                boletos_liquidados.append({
+                    "Nome do Pagador": nome_pagador,
+                    "Nome do Imóvel": seu_no,
+                    "Data de Vencimento": vencto,
+                    "Data de Pagamento": data_pgto,
+                    "Valor Original": v_orig,
+                    "Valor Original Formatado": f"R$ {val_orig_str}",
+                    "Valor Pago": v_pago,
+                    "Valor Pago Formatado": f"R$ {val_pago_str}",
+                    "Status": "Liquidado"
+                })
+
+    return meta, pd.DataFrame(boletos_liquidados), texto_bruto_acumulado
 
 def fmt_brl(valor):
     return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
@@ -232,7 +226,7 @@ def gerar_pdf_relatorio(meta, df_boletos):
     return pdf_buffer.getvalue()
 
 if arquivo_pdf is not None:
-    meta, df_boletos = extrair_dados_e_metadados(arquivo_pdf)
+    meta, df_boletos, texto_extraido = extrair_dados_e_metadados(arquivo_pdf)
     
     if not df_boletos.empty:
         st.subheader(f"CONSULTA EXTRATO E-COBRANÇA (CEDENTE: {meta['cedente']})")
@@ -274,3 +268,5 @@ if arquivo_pdf is not None:
             st.error("Erro ao gerar o PDF.")
     else:
         st.warning("Nenhum boleto liquidado foi encontrado no extrato enviado.")
+        with st.expander("🔍 Diagnóstico do Texto Extraído do PDF"):
+            st.text(texto_extraido)
