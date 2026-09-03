@@ -38,7 +38,7 @@ def extrair_dados_e_metadados(pdf_bytes):
 
     linhas_puras = [l.strip() for l in texto_completo.split('\n') if l.strip()]
 
-    # 1. Extração do Responsável pela Conta (Nome + CPF)
+    # 1. Extração do Responsável pela Conta
     for l in linhas_puras[:8]:
         if re.search(r'\d{3}\.\d{3}\.\d{3}\-\d{2}', l) and 'CEDENTE' not in l.upper():
             meta["responsavel"] = l.strip()
@@ -61,7 +61,6 @@ def extrair_dados_e_metadados(pdf_bytes):
     linhas_norm = [normalizar(l) for l in linhas_puras]
 
     for idx, l_norm in enumerate(linhas_norm):
-        # Localiza o crédito de liquidação (ex: 5.608,72C)
         match_cred = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*C\b', l_norm)
         
         if match_cred:
@@ -69,10 +68,7 @@ def extrair_dados_e_metadados(pdf_bytes):
             fim = min(len(linhas_norm), idx + 3)
             bloco_norm = " ".join(linhas_norm[inicio:fim])
             
-            # Confirma que é linha de liquidação
             if 'LIQUIDAC' in bloco_norm or 'BLOQUETO' in bloco_norm:
-                
-                # Coleta o Nosso Número para não duplicar com a tarifa de débito
                 match_doc = re.search(r'\b(\d{14,17})\b', bloco_norm)
                 doc_id = match_doc.group(1) if match_doc else f"DOC_{idx}"
                 
@@ -80,14 +76,12 @@ def extrair_dados_e_metadados(pdf_bytes):
                     continue
                 documentos_processados.add(doc_id)
 
-                # Datas na ordem: 1ª = Vencimento | 2ª = Pagamento
                 bloco_orig = " ".join(linhas_puras[inicio:fim])
                 datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', bloco_orig)
                 
                 data_vencimento = datas[0] if len(datas) >= 1 else "-"
                 data_pagamento = datas[1] if len(datas) >= 2 else data_vencimento
 
-                # Valores
                 val_pago_str = match_cred.group(1)
                 todos_valores = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', bloco_orig)
                 val_orig_str = todos_valores[0] if todos_valores else val_pago_str
@@ -95,7 +89,6 @@ def extrair_dados_e_metadados(pdf_bytes):
                 v_orig = float(val_orig_str.replace('.', '').replace(',', '.'))
                 v_pago = float(val_pago_str.replace('.', '').replace(',', '.'))
 
-                # Extração do Nome do Pagador Completo
                 termos_ignorar = {
                     'CAIXA', 'CEDENTE', 'NOSSA', 'SACADO', 'SEU', 'VENCTO', 'DATA', 
                     'PAGTO', 'VALOR', 'TITULO', 'LIQ', 'RECEBIDO', 'DESC/ABAT', 
@@ -105,14 +98,12 @@ def extrair_dados_e_metadados(pdf_bytes):
 
                 palavras_sacado = []
                 for lin in linhas_puras[inicio:idx+1]:
-                    # Remove datas, valores e números de controle
                     l_limpa = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', lin)
                     l_limpa = re.sub(r'\b\d{1,3}(?:\.\d{3})*,\d{2}[CD]?\b', '', l_limpa)
                     l_limpa = re.sub(r'\b\d{10,18}\b', '', l_limpa)
                     
                     for token in l_limpa.split():
                         tok_sem_pont = re.sub(r'[^\w]', '', token)
-                        # Descarta o Seu Nº caso seja número isolado curto
                         if tok_sem_pont.isdigit() and len(tok_sem_pont) <= 5:
                             continue
                         if normalizar(tok_sem_pont) not in termos_ignorar and len(tok_sem_pont) > 0:
@@ -151,52 +142,83 @@ def gerar_pdf_relatorio(meta, df_boletos):
             <td align="center">{row['Data de Vencimento']}</td>
             <td align="center">{row['Data de Pagamento']}</td>
             <td align="right">{row['Valor Original Formatado']}</td>
-            <td align="right"><b>{row['Valor Pago Formatado']}</b></td>
-            <td align="center">Liquidado</td>
+            <td align="right">{row['Valor Pago Formatado']}</td>
         </tr>
         """
 
+    # Estrutura com medidas absolutas e sem conflito de padding para evitar a quebra do ReportLab
     html_full = f"""
     <html>
     <head>
         <style>
-            @page {{ size: a4 landscape; margin: 1cm; }}
-            body {{ font-family: Helvetica, Arial, sans-serif; font-size: 8.5pt; color: #111111; }}
-            .header-table {{ width: 100%; background-color: #1e3a8a; color: #ffffff; padding: 10px; margin-bottom: 10px; border-radius: 4px; }}
-            .info-table {{ width: 100%; background-color: #f1f5f9; padding: 6px; margin-bottom: 10px; border: 1px solid #cbd5e1; }}
-            table.data-table {{ width: 100%; border-collapse: collapse; }}
-            table.data-table th {{ background-color: #e2e8f0; padding: 6px; font-size: 8pt; border-bottom: 1px solid #94a3b8; }}
-            table.data-table td {{ padding: 6px; border-bottom: 1px solid #e2e8f0; font-size: 8pt; }}
-            .total-box {{ background-color: #dcfce7; border: 1px solid #86efac; padding: 8px; font-size: 10pt; font-weight: bold; color: #166534; text-align: right; margin-top: 10px; }}
+            @page {{
+                size: a4 landscape;
+                margin: 10mm;
+            }}
+            body {{
+                font-family: Helvetica, sans-serif;
+                font-size: 8pt;
+                color: #222222;
+            }}
+            .header-box {{
+                background-color: #1e3a8a;
+                color: #ffffff;
+                padding: 6pt;
+                margin-bottom: 6pt;
+            }}
+            .info-box {{
+                background-color: #f1f5f9;
+                padding: 4pt;
+                margin-bottom: 8pt;
+                border: 0.5pt solid #cbd5e1;
+            }}
+            table.data-table {{
+                width: 100%;
+                border-collapse: collapse;
+            }}
+            table.data-table th {{
+                background-color: #e2e8f0;
+                font-size: 7.5pt;
+                border-bottom: 1pt solid #94a3b8;
+                padding: 3pt;
+            }}
+            table.data-table td {{
+                border-bottom: 0.5pt solid #e2e8f0;
+                font-size: 7.5pt;
+                padding: 3pt;
+            }}
+            .total-box {{
+                background-color: #dcfce7;
+                border: 0.5pt solid #86efac;
+                padding: 6pt;
+                font-size: 9pt;
+                font-weight: bold;
+                color: #166534;
+                text-align: right;
+                margin-top: 8pt;
+            }}
         </style>
     </head>
     <body>
-        <table class="header-table">
-            <tr>
-                <td>
-                    <font size="3"><b>CONSULTA EXTRATO E-COBRANÇA</b></font><br/>
-                    <b>{meta['responsavel']}</b><br/>
-                    {meta['cedente']}
-                </td>
-            </tr>
-        </table>
+        <div class="header-box">
+            <b><font size="3">CONSULTA EXTRATO E-COBRANÇA</font></b><br/>
+            <b>{meta['responsavel']}</b><br/>
+            {meta['cedente']}
+        </div>
         
-        <table class="info-table">
-            <tr>
-                <td><b>Período:</b> {meta['periodo']}</td>
-                <td align="right"><b>Data de Emissão:</b> {data_emissao}</td>
-            </tr>
-        </table>
+        <div class="info-box">
+            <b>Período:</b> {meta['periodo']} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Data de Emissão:</b> {data_emissao}
+        </div>
 
         <table class="data-table">
             <thead>
                 <tr>
-                    <th width="5%">Item</th>
-                    <th width="43%">Nome do Pagador</th>
-                    <th width="13%">Data de Vencimento</th>
-                    <th width="13%">Data de Pagamento</th>
-                    <th width="13%">Valor Original</th>
-                    <th width="13%">Valor Pago</th>
+                    <th width="25">Item</th>
+                    <th width="320">Nome do Pagador</th>
+                    <th width="85">Data de Vencimento</th>
+                    <th width="85">Data de Pagamento</th>
+                    <th width="90">Valor Original</th>
+                    <th width="90">Valor Pago</th>
                 </tr>
             </thead>
             <tbody>
